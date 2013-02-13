@@ -1,3 +1,5 @@
+/* vim: set ts=8 sw=8 noexpandtab: */
+
 /* Copyright (c) 2006-2012 Jonas Fonseca <fonseca@diku.dk>
  *
  * This program is free software; you can redistribute it and/or
@@ -1120,6 +1122,7 @@ enum run_request_flag {
 	RUN_REQUEST_SILENT	= 2,
 	RUN_REQUEST_CONFIRM	= 4,
 	RUN_REQUEST_EXIT	= 8,
+	RUN_REQUEST_INTERNAL	= 16,
 };
 
 struct run_request {
@@ -1129,6 +1132,7 @@ struct run_request {
 	bool silent;
 	bool confirm;
 	bool exit;
+	bool internal;
 };
 
 static struct run_request *run_request;
@@ -1155,6 +1159,7 @@ add_run_request(struct keymap *keymap, int key, const char **argv, enum run_requ
 	req->silent = flags & RUN_REQUEST_SILENT;
 	req->confirm = flags & RUN_REQUEST_CONFIRM;
 	req->exit = flags & RUN_REQUEST_EXIT;
+	req->internal = flags & RUN_REQUEST_INTERNAL;
 	req->keymap = keymap;
 	req->key = key;
 
@@ -1408,7 +1413,7 @@ parse_encoding(struct encoding **encoding_ref, const char *arg, bool priority)
 static enum option_code
 parse_args(const char ***args, const char *argv[])
 {
-	if (*args == NULL && !argv_copy(args, argv))
+	if (!argv_copy(args, argv))
 		return OPT_ERR_OUT_OF_MEMORY;
 	return OPT_OK;
 }
@@ -1425,6 +1430,9 @@ option_set_command(int argc, const char *argv[])
 
 	if (!strcmp(argv[0], "blame-options"))
 		return parse_args(&opt_blame_argv, argv + 2);
+
+	if (!strcmp(argv[0], "diff-options"))
+		return parse_args(&opt_diff_argv, argv + 2);
 
 	if (argc != 3)
 		return OPT_ERR_WRONG_NUMBER_OF_ARGUMENTS;
@@ -1573,27 +1581,35 @@ option_bind_command(int argc, const char *argv[])
 			return OPT_ERR_OBSOLETE_REQUEST_NAME;
 		}
 	}
-	if (request == REQ_UNKNOWN && *argv[2]++ == '!') {
-		enum run_request_flag flags = RUN_REQUEST_FORCE;
 
-		while (*argv[2]) {
-			if (*argv[2] == '@') {
-				flags |= RUN_REQUEST_SILENT;
-			} else if (*argv[2] == '?') {
-				flags |= RUN_REQUEST_CONFIRM;
-			} else if (*argv[2] == '<') {
-				flags |= RUN_REQUEST_EXIT;
-			} else {
-				break;
+	if (request == REQ_UNKNOWN) {
+		char first = *argv[2]++;
+
+		if (first == '!') {
+			enum run_request_flag flags = RUN_REQUEST_FORCE;
+
+			while (*argv[2]) {
+				if (*argv[2] == '@') {
+					flags |= RUN_REQUEST_SILENT;
+				} else if (*argv[2] == '?') {
+					flags |= RUN_REQUEST_CONFIRM;
+				} else if (*argv[2] == '<') {
+					flags |= RUN_REQUEST_EXIT;
+				} else {
+					break;
+				}
+				argv[2]++;
 			}
-			argv[2]++;
-		}
 
-		return add_run_request(keymap, key, argv + 2, flags)
-			? OPT_OK : OPT_ERR_OUT_OF_MEMORY;
+			return add_run_request(keymap, key, argv + 2, flags)
+				? OPT_OK : OPT_ERR_OUT_OF_MEMORY;
+		} else if (first == ':') {
+			return add_run_request(keymap, key, argv + 2, RUN_REQUEST_FORCE | RUN_REQUEST_INTERNAL)
+				? OPT_OK : OPT_ERR_OUT_OF_MEMORY;
+		} else {
+			return OPT_ERR_UNKNOWN_REQUEST_NAME;
+		}
 	}
-	if (request == REQ_UNKNOWN)
-		return OPT_ERR_UNKNOWN_REQUEST_NAME;
 
 	add_keybinding(keymap, request, key);
 
@@ -1705,6 +1721,7 @@ load_options(void)
 	const char *tigrc_user = getenv("TIGRC_USER");
 	const char *tigrc_system = getenv("TIGRC_SYSTEM");
 	const char *tig_diff_opts = getenv("TIG_DIFF_OPTS");
+	const bool diff_opts_from_args = !!opt_diff_argv;
 	char buf[SIZEOF_STR];
 
 	if (!tigrc_system)
@@ -1722,7 +1739,7 @@ load_options(void)
 	 * that conflict with keybindings. */
 	add_builtin_run_requests();
 
-	if (!opt_diff_argv && tig_diff_opts && *tig_diff_opts) {
+	if (!diff_opts_from_args && tig_diff_opts && *tig_diff_opts) {
 		static const char *diff_opts[SIZEOF_ARG] = { NULL };
 		int argc = 0;
 
@@ -3441,35 +3458,48 @@ open_editor(const char *file)
 	open_external_viewer(editor_argv, opt_cdup, TRUE);
 }
 
-static bool
-open_run_request(enum request request)
+static enum request run_prompt_command(struct view *view, char *cmd);
+
+static enum request
+open_run_request(struct view *view, enum request request)
 {
 	struct run_request *req = get_run_request(request);
 	const char **argv = NULL;
 
+	request = REQ_NONE;
+
 	if (!req) {
 		report("Unknown run request");
-		return FALSE;
+		return request;
 	}
 
 	if (format_argv(&argv, req->argv, FALSE)) {
-		bool confirmed = !req->confirm;
+		if (req->internal) {
+			char cmd[SIZEOF_STR];
 
-		if (req->confirm) {
-			char cmd[SIZEOF_STR], prompt[SIZEOF_STR];
-
-			if (argv_to_string(argv, cmd, sizeof(cmd), " ") &&
-			    string_format(prompt, "Run `%s`?", cmd) &&
-			    prompt_yesno(prompt)) {
-				confirmed = TRUE;
+			if (argv_to_string(argv, cmd, sizeof(cmd), " ")) {
+				request = run_prompt_command(view, cmd);
 			}
 		}
+		else {
+			bool confirmed = !req->confirm;
 
-		if (confirmed && argv_remove_quotes(argv)) {
-			if (req->silent)
-				io_run_bg(argv);
-			else
-				open_external_viewer(argv, NULL, !req->exit);
+			if (req->confirm) {
+				char cmd[SIZEOF_STR], prompt[SIZEOF_STR];
+
+				if (argv_to_string(argv, cmd, sizeof(cmd), " ") &&
+				    string_format(prompt, "Run `%s`?", cmd) &&
+				    prompt_yesno(prompt)) {
+					confirmed = TRUE;
+				}
+			}
+
+			if (confirmed && argv_remove_quotes(argv)) {
+				if (req->silent)
+					io_run_bg(argv);
+				else
+					open_external_viewer(argv, NULL, !req->exit);
+			}
 		}
 	}
 
@@ -3477,7 +3507,14 @@ open_run_request(enum request request)
 		argv_free(argv);
 	free(argv);
 
-	return req->exit;
+	if (request == REQ_NONE) {
+		if (req->exit)
+			request = REQ_QUIT;
+
+		else if (!view->unrefreshable)
+			request = REQ_REFRESH;
+	}
+	return request;
 }
 
 /*
@@ -3493,11 +3530,11 @@ view_driver(struct view *view, enum request request)
 		return TRUE;
 
 	if (request > REQ_NONE) {
-		if (open_run_request(request))
+		request = open_run_request(view, request);
+
+		// exit quickly rather than going through view_request and back
+		if (request == REQ_QUIT)
 			return FALSE;
-		if (!view->unrefreshable)
-			view_request(view, REQ_REFRESH);
-		return TRUE;
 	}
 
 	request = view_request(view, request);
@@ -4535,6 +4572,10 @@ diff_request(struct view *view, enum request request, struct line *line)
 
 	case REQ_ENTER:
 		return diff_common_enter(view, request, line);
+
+	case REQ_REFRESH:
+		reload_view(view);
+		return REQ_NONE;
 
 	default:
 		return pager_request(view, request, line);
@@ -8253,6 +8294,70 @@ parse_options(int argc, const char *argv[])
 	return request;
 }
 
+static enum request
+run_prompt_command(struct view *view, char *cmd) {
+	enum request request;
+
+	if (cmd && string_isnumber(cmd)) {
+		int lineno = view->pos.lineno + 1;
+
+		if (parse_int(&lineno, cmd, 1, view->lines + 1) == OPT_OK) {
+			select_view_line(view, lineno - 1);
+			report_clear();
+		} else {
+			report("Unable to parse '%s' as a line number", cmd);
+		}
+	} else if (cmd && iscommit(cmd)) {
+		string_ncopy(opt_search, cmd, strlen(cmd));
+
+		request = view_request(view, REQ_JUMP_COMMIT);
+		if (request == REQ_JUMP_COMMIT) {
+			report("Jumping to commits is not supported by the '%s' view", view->name);
+		}
+
+	} else if (cmd && strlen(cmd) == 1) {
+		request = get_keybinding(&view->ops->keymap, cmd[0]);
+		return request;
+
+	} else if (cmd && cmd[0] == '!') {
+		struct view *next = VIEW(REQ_VIEW_PAGER);
+		const char *argv[SIZEOF_ARG];
+		int argc = 0;
+
+		cmd++;
+		/* When running random commands, initially show the
+		 * command in the title. However, it maybe later be
+		 * overwritten if a commit line is selected. */
+		string_ncopy(next->ref, cmd, strlen(cmd));
+
+		if (!argv_from_string(argv, &argc, cmd)) {
+			report("Too many arguments");
+		} else if (!format_argv(&next->argv, argv, FALSE)) {
+			report("Argument formatting failed");
+		} else {
+			next->dir = NULL;
+			open_view(view, REQ_VIEW_PAGER, OPEN_PREPARED);
+		}
+
+	} else if (cmd) {
+		request = get_request(cmd);
+		if (request != REQ_UNKNOWN)
+			return request;
+
+		char *args = strchr(cmd, ' ');
+		if (args) {
+			*args++ = 0;
+			if (set_option(cmd, args) == OPT_OK) {
+				request = !view->unrefreshable ? REQ_REFRESH : REQ_SCREEN_REDRAW;
+				if (!strcmp(cmd, "color"))
+					init_colors();
+			}
+		}
+		return request;
+	}
+	return REQ_NONE;
+}
+
 int
 main(int argc, const char *argv[])
 {
@@ -8317,66 +8422,7 @@ main(int argc, const char *argv[])
 		case REQ_PROMPT:
 		{
 			char *cmd = read_prompt(":");
-
-			if (cmd && string_isnumber(cmd)) {
-				int lineno = view->pos.lineno + 1;
-
-				if (parse_int(&lineno, cmd, 1, view->lines + 1) == OPT_OK) {
-					select_view_line(view, lineno - 1);
-					report_clear();
-				} else {
-					report("Unable to parse '%s' as a line number", cmd);
-				}
-			} else if (cmd && iscommit(cmd)) {
-				string_ncopy(opt_search, cmd, strlen(cmd));
-
-				request = view_request(view, REQ_JUMP_COMMIT);
-				if (request == REQ_JUMP_COMMIT) {
-					report("Jumping to commits is not supported by the '%s' view", view->name);
-				}
-
-			} else if (cmd && strlen(cmd) == 1) {
-				request = get_keybinding(&view->ops->keymap, cmd[0]);
-				break;
-
-			} else if (cmd && cmd[0] == '!') {
-				struct view *next = VIEW(REQ_VIEW_PAGER);
-				const char *argv[SIZEOF_ARG];
-				int argc = 0;
-
-				cmd++;
-				/* When running random commands, initially show the
-				 * command in the title. However, it maybe later be
-				 * overwritten if a commit line is selected. */
-				string_ncopy(next->ref, cmd, strlen(cmd));
-
-				if (!argv_from_string(argv, &argc, cmd)) {
-					report("Too many arguments");
-				} else if (!format_argv(&next->argv, argv, FALSE)) {
-					report("Argument formatting failed");
-				} else {
-					next->dir = NULL;
-					open_view(view, REQ_VIEW_PAGER, OPEN_PREPARED);
-				}
-
-			} else if (cmd) {
-				request = get_request(cmd);
-				if (request != REQ_UNKNOWN)
-					break;
-
-				char *args = strchr(cmd, ' ');
-				if (args) {
-					*args++ = 0;
-					if (set_option(cmd, args) == OPT_OK) {
-						request = REQ_SCREEN_REDRAW;
-						if (!strcmp(cmd, "color"))
-							init_colors();
-					}
-				}
-				break;
-			}
-
-			request = REQ_NONE;
+			request = run_prompt_command(view, cmd);
 			break;
 		}
 		case REQ_SEARCH:
